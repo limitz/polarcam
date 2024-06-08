@@ -1,6 +1,7 @@
 event27
 .ipynb_checkpoints/
 __pycache__/
+build/
 *.pyc
 *.swp
 *.swo
