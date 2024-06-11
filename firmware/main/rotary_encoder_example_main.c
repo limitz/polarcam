@@ -13,9 +13,54 @@
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 #include "driver/mcpwm_prelude.h"
-
+#include "esp_adc/adc_continuous.h"
+#include <string.h>
 static const char *TAG = "example";
 
+#define EXPOSURE_ADC_UNIT ADC_UNIT_1
+#define EXPOSURE_ADC_CONV_MODE ADC_CONV_SINGLE_UNIT_1
+#define EXPOSURE_ADC_ATTENUATION ADC_ATTEN_DB_0
+#define EXPOSURE_ADC_BIT_WIDTH SOC_ADC_DIGI_MAX_BITWIDTH
+#define EXPOSURE_ADC_OUTPUT_TYPE ADC_DIGI_OUTPUT_FORMAT_TYPE1
+volatile int s_exposure = 1000;
+static adc_channel_t channel[] = { ADC_CHANNEL_7 };
+
+static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void* user_data)
+{
+    BaseType_t mustYield = pdFALSE;
+    TaskHandle_t task_handle = (TaskHandle_t) user_data;
+    vTaskNotifyGiveFromISR(task_handle, &mustYield);
+    return (mustYield == pdTRUE);
+}
+
+static void exposure_adc_init(adc_channel_t* channel, uint8_t channel_num, adc_continuous_handle_t *out_handle)
+{
+    adc_continuous_handle_t handle = NULL;
+    adc_continuous_handle_cfg_t adc_config = {
+        .max_store_buf_size=1024,
+        .conv_frame_size=256,
+    };
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
+
+    adc_continuous_config_t dig_config = {
+        .sample_freq_hz = 20000,
+        .conv_mode = EXPOSURE_ADC_CONV_MODE,
+        .format = EXPOSURE_ADC_OUTPUT_TYPE,
+    };
+    adc_digi_pattern_config_t adc_pattern[SOC_ADC_PATT_LEN_MAX] = {0};
+    dig_config.pattern_num = channel_num;
+    for (int i=0; i<channel_num; i++) 
+    {
+        adc_pattern[i].atten = EXPOSURE_ADC_ATTENUATION;
+        adc_pattern[i].channel = channel[i] & 0x7;
+        adc_pattern[i].unit = EXPOSURE_ADC_UNIT;
+        adc_pattern[i].bit_width = EXPOSURE_ADC_BIT_WIDTH;
+    }
+    dig_config.adc_pattern = adc_pattern;
+    ESP_ERROR_CHECK(adc_continuous_config(handle, &dig_config));
+    *out_handle = handle;
+
+}
 #define EXAMPLE_PCNT_HIGH_LIMIT 100
 #define EXAMPLE_PCNT_LOW_LIMIT  -100
 
@@ -32,7 +77,7 @@ static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_even
     xQueueSendFromISR(queue, &(edata->watch_point_value), &high_task_wakeup);
     return (high_task_wakeup == pdTRUE);
 }
-
+/*
 static bool timer_stopped(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *edata, void *user_ctx)
 {
     BaseType_t high_task_wakeup;
@@ -48,8 +93,48 @@ static bool timer_empty(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data
     xQueueSendFromISR(queue, &(edata->count_value), &high_task_wakeup);
     return (high_task_wakeup == pdTRUE);
 }
+*/
+
+void exposure_adc_task()
+{
+    uint8_t buffer[256] = {0};
+    memset(buffer, 0xCC, 256);
+    adc_continuous_handle_t handle = NULL;
+    exposure_adc_init(channel, 1, &handle);
+    adc_continuous_evt_cbs_t callbacks = {
+        .on_conv_done = s_conv_done_cb,
+    };
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(handle, &callbacks, xTaskGetCurrentTaskHandle()));
+    ESP_ERROR_CHECK(adc_continuous_start(handle));
+
+    while(1)
+    {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        while (1)
+        {
+            uint32_t length;
+            int ret = adc_continuous_read(handle, buffer, 256, &length, 0);
+            if (ESP_OK != ret) break;
+                    
+            for (int i=0; i<length; i+=SOC_ADC_DIGI_RESULT_BYTES) 
+            {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&buffer[i];
+                uint32_t c = p->type1.channel;
+                uint32_t d = p->type1.data;
+                s_exposure = d;
+                ESP_LOGI("EXPOSURE", "%lu => %lu", c, d);
+            }
+            vTaskDelay(1);
+        }
+    }
+}
 void app_main(void)
 {
+    TaskHandle_t exposure_adc_task_handle;
+    xTaskCreate( exposure_adc_task, "EXPOSURE TASK", 2048, NULL, tskIDLE_PRIORITY, &exposure_adc_task_handle );
+
+
     ESP_LOGI(TAG, "install pcnt unit");
     pcnt_unit_config_t unit_config = {
         .high_limit = 100,
@@ -152,10 +237,10 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(mcpwm_timer_set_phase_on_sync(timer, &phase_config));
 
-    mcpwm_timer_event_callbacks_t timer_cbs = {
-        .on_stop = timer_stopped, 
-    };
-    mcpwm_timer_register_event_callbacks(timer, &timer_cbs, queue);
+    //mcpwm_timer_event_callbacks_t timer_cbs = {
+    //    .on_stop = timer_stopped, 
+    //};
+    //mcpwm_timer_register_event_callbacks(timer, &timer_cbs, queue);
     
     ESP_ERROR_CHECK(mcpwm_timer_enable(timer));
     //ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_STOP_FULL));
@@ -167,8 +252,9 @@ void app_main(void)
     while (1) {
         if (xQueueReceive(queue, &event_count, pdMS_TO_TICKS(1000))) {
             ESP_LOGI(TAG, "Watch point event, count: %d", event_count);
-            if (event_count == 1)
+            if (event_count > 0)
             {
+                ESP_ERROR_CHECK(mcpwm_timer_set_period(timer, s_exposure));
                 ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_STOP_FULL));
                 pcnt_unit_clear_count(pcnt_unit);
             }
