@@ -17,13 +17,14 @@
 #include <string.h>
 static const char *TAG = "example";
 
+#define EXPOSURE_ADC_FRAME_SIZE 32
 #define EXPOSURE_ADC_UNIT ADC_UNIT_1
 #define EXPOSURE_ADC_CONV_MODE ADC_CONV_SINGLE_UNIT_1
 #define EXPOSURE_ADC_ATTENUATION ADC_ATTEN_DB_0
 #define EXPOSURE_ADC_BIT_WIDTH SOC_ADC_DIGI_MAX_BITWIDTH
 #define EXPOSURE_ADC_OUTPUT_TYPE ADC_DIGI_OUTPUT_FORMAT_TYPE1
 volatile int s_exposure = 1000;
-static adc_channel_t channel[] = { ADC_CHANNEL_7 };
+static adc_channel_t channel[] = { ADC_CHANNEL_3 };
 
 static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void* user_data)
 {
@@ -38,7 +39,7 @@ static void exposure_adc_init(adc_channel_t* channel, uint8_t channel_num, adc_c
     adc_continuous_handle_t handle = NULL;
     adc_continuous_handle_cfg_t adc_config = {
         .max_store_buf_size=1024,
-        .conv_frame_size=256,
+        .conv_frame_size=EXPOSURE_ADC_FRAME_SIZE,
     };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
 
@@ -97,8 +98,8 @@ static bool timer_empty(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data
 
 void exposure_adc_task()
 {
-    uint8_t buffer[256] = {0};
-    memset(buffer, 0xCC, 256);
+    uint8_t buffer[EXPOSURE_ADC_FRAME_SIZE] = {0};
+    memset(buffer, 0xCC,EXPOSURE_ADC_FRAME_SIZE);
     adc_continuous_handle_t handle = NULL;
     exposure_adc_init(channel, 1, &handle);
     adc_continuous_evt_cbs_t callbacks = {
@@ -114,7 +115,7 @@ void exposure_adc_task()
         while (1)
         {
             uint32_t length;
-            int ret = adc_continuous_read(handle, buffer, 256, &length, 0);
+            int ret = adc_continuous_read(handle, buffer, EXPOSURE_ADC_FRAME_SIZE , &length, 0);
             if (ESP_OK != ret) break;
                     
             for (int i=0; i<length; i+=SOC_ADC_DIGI_RESULT_BYTES) 
@@ -132,7 +133,7 @@ void exposure_adc_task()
 void app_main(void)
 {
     TaskHandle_t exposure_adc_task_handle;
-    xTaskCreate( exposure_adc_task, "EXPOSURE TASK", 2048, NULL, tskIDLE_PRIORITY, &exposure_adc_task_handle );
+    xTaskCreate( exposure_adc_task, "EXPOSURE TASK", 1<<12, NULL, tskIDLE_PRIORITY, &exposure_adc_task_handle );
 
 
     ESP_LOGI(TAG, "install pcnt unit");
